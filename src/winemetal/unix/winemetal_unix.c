@@ -2475,6 +2475,14 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
             threadsPerMeshThreadgroup:MTLSizeMake(1, 1, 1)];
       break;
     }
+    case WMTRenderCommandMadeiraTessellationDraw: {
+      struct wmtcmd_render_madeira_tessellation_draw *body =
+          (struct wmtcmd_render_madeira_tessellation_draw *)next;
+      extern void madeira_ir_tess_draw(uint64_t, const void *);
+      if (body->index_buffer) wmt_stale_check(body->index_buffer, "DXIL tessellation index buffer");
+      madeira_ir_tess_draw((uint64_t)(uintptr_t)encoder, &body->config);
+      break;
+    }
     case WMTRenderCommandDXMTGeometryDrawIndirect: {
       struct wmtcmd_render_dxmt_geometry_draw_indirect *body = (struct wmtcmd_render_dxmt_geometry_draw_indirect *)next;
       wmt_stale_check(body->indirect_args_buffer, "gs indirect args");
@@ -3132,13 +3140,200 @@ _MTLCommandBuffer_encodeTemporalScale(void *obj) {
   return STATUS_SUCCESS;
 }
 
+#if TARGET_OS_IOS
+/* ml2035: MetalFX is an upscaler, not a general-purpose pixel-format copy.
+ * A same-size RGBA8 -> BGRA8 scale can complete successfully while leaving
+ * the CAMetalLayer drawable black.  This is the exact conversion Madeira's
+ * D3D12 swapchain needs for DXGI_FORMAT_R8G8B8A8_UNORM on iOS.  Render the
+ * source through Metal's typed texture interface instead: reading RGBA and
+ * writing a BGRA attachment performs the channel mapping by definition.
+ *
+ * Compile lazily because this Unix side is also used before any swapchain
+ * exists.  Keep one pipeline for each legal layer colour space.  A failure is
+ * non-fatal and falls through to the old MetalFX path, with an actionable log.
+ */
+static id<MTLRenderPipelineState>
+madeira_rgba_bgra_scanout_pipeline(id<MTLDevice> device, MTLPixelFormat output_format)
+{
+  static id<MTLDevice> cached_device;
+  static id<MTLRenderPipelineState> linear_pipeline, srgb_pipeline;
+  static int tried_linear, tried_srgb;
+  id<MTLRenderPipelineState> *pipeline;
+  int *tried;
+
+  if (output_format == MTLPixelFormatBGRA8Unorm) {
+    pipeline = &linear_pipeline;
+    tried = &tried_linear;
+  } else if (output_format == MTLPixelFormatBGRA8Unorm_sRGB) {
+    pipeline = &srgb_pipeline;
+    tried = &tried_srgb;
+  } else {
+    return nil;
+  }
+
+  @synchronized([MTLFXSpatialScalerDescriptor class]) {
+    if (cached_device != device) {
+      [linear_pipeline release]; linear_pipeline = nil;
+      [srgb_pipeline release]; srgb_pipeline = nil;
+      cached_device = device;
+      tried_linear = tried_srgb = 0;
+    }
+    if (!*pipeline && !*tried) {
+      static NSString *const shader_source =
+          @"#include <metal_stdlib>\n"
+          @"using namespace metal;\n"
+          @"struct ScanoutVertex { float4 position [[position]]; };\n"
+          @"vertex ScanoutVertex madeira_scanout_vs(uint vertex_id [[vertex_id]]) {\n"
+          @"  const float2 p[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };\n"
+          @"  ScanoutVertex out; out.position = float4(p[vertex_id], 0.0, 1.0); return out;\n"
+          @"}\n"
+          @"fragment float4 madeira_scanout_fs(ScanoutVertex in [[stage_in]],\n"
+          @"                                      texture2d_array<float> source [[texture(0)]]) {\n"
+          @"  float4 c = source.read(uint2(in.position.xy), 0);\n"
+          @"  return float4(c.rgb, 1.0);\n"
+          @"}\n";
+      NSError *error = nil;
+      id<MTLLibrary> library;
+      id<MTLFunction> vertex, fragment;
+      MTLRenderPipelineDescriptor *descriptor;
+
+      *tried = 1;
+      library = [device newLibraryWithSource:shader_source options:nil error:&error];
+      vertex = [library newFunctionWithName:@"madeira_scanout_vs"];
+      fragment = [library newFunctionWithName:@"madeira_scanout_fs"];
+      descriptor = [[MTLRenderPipelineDescriptor alloc] init];
+      descriptor.vertexFunction = vertex;
+      descriptor.fragmentFunction = fragment;
+      descriptor.colorAttachments[0].pixelFormat = output_format;
+      if (library && vertex && fragment)
+        *pipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+      [descriptor release];
+      [fragment release];
+      [vertex release];
+      [library release];
+      if (*pipeline)
+        fprintf(stderr, "[winemetal] ml2042 RGBA-to-BGRA shader scanout active (format %lu)\n",
+                (unsigned long)output_format);
+      else
+        fprintf(stderr, "[winemetal] ml2042 scanout shader creation failed; falling back to MetalFX: %s\n",
+                error ? [[error localizedDescription] UTF8String] : "unknown error");
+    }
+  }
+  return *pipeline;
+}
+
+static BOOL
+madeira_encode_rgba_bgra_scanout(id<MTLCommandBuffer> cmdbuf,
+                                 id<MTLTexture> color, id<MTLTexture> output)
+{
+  static _Atomic uint64_t scanout_frames;
+  MTLPixelFormat input_format = color.pixelFormat;
+  MTLPixelFormat output_format = output.pixelFormat;
+  id<MTLRenderPipelineState> pipeline;
+  MTLRenderPassDescriptor *pass;
+  id<MTLRenderCommandEncoder> encoder;
+
+  if (color.width != output.width || color.height != output.height ||
+      !((input_format == MTLPixelFormatRGBA8Unorm && output_format == MTLPixelFormatBGRA8Unorm) ||
+        (input_format == MTLPixelFormatRGBA8Unorm_sRGB && output_format == MTLPixelFormatBGRA8Unorm_sRGB)))
+    return NO;
+
+  pipeline = madeira_rgba_bgra_scanout_pipeline(cmdbuf.device, output_format);
+  if (!pipeline) return NO;
+  pass = [MTLRenderPassDescriptor renderPassDescriptor];
+  pass.colorAttachments[0].texture = output;
+  pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+  pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+  encoder = [cmdbuf renderCommandEncoderWithDescriptor:pass];
+  if (!encoder) return NO;
+  [encoder setRenderPipelineState:pipeline];
+  [encoder setFragmentTexture:color atIndex:0];
+  [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+  [encoder endEncoding];
+
+  /* ml2036: device-side truth for a black display.  On two bounded frames,
+   * copy both the D3D12 backbuffer and the converted drawable into shared
+   * memory after the render pass, then report how many pixels carry colour.
+   * This distinguishes "the game rendered black" from "CoreAnimation never
+   * showed non-black pixels" without a GPU capture or another diagnostic
+   * build.  Two 720p probes cost ~7 MB each and nothing on steady-state frames. */
+  {
+    uint64_t frame = atomic_fetch_add_explicit(&scanout_frames, 1, memory_order_relaxed) + 1;
+    if (frame == 1)
+      fprintf(stderr, "[scanout-proof] ml2041 late-frame source/drawable probes armed through frame 3000\n");
+    /* ml2041: the menu is reached well after the original 120/600 startup
+     * probes on slower devices. Keep the early proof, then sample every 600th
+     * frame through 3000 so a normal launch proves whether later content ever
+     * reaches the D3D12 backbuffer and drawable. */
+    if (frame == 120 || (frame <= 3000 && frame % 600 == 0)) {
+      NSUInteger width = color.width, height = color.height;
+      NSUInteger bytes_per_row = (width * 4 + 255) & ~(NSUInteger)255;
+      NSUInteger length = bytes_per_row * height;
+      id<MTLDevice> device = cmdbuf.device;
+      id<MTLBuffer> source_bytes = [device newBufferWithLength:length options:MTLResourceStorageModeShared];
+      id<MTLBuffer> output_bytes = [device newBufferWithLength:length options:MTLResourceStorageModeShared];
+      id<MTLBlitCommandEncoder> blit = source_bytes && output_bytes ? [cmdbuf blitCommandEncoder] : nil;
+      if (blit) {
+        MTLSize size = MTLSizeMake(width, height, 1);
+        [blit copyFromTexture:color sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                    sourceSize:size toBuffer:source_bytes destinationOffset:0
+           destinationBytesPerRow:bytes_per_row destinationBytesPerImage:length];
+        [blit copyFromTexture:output sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                    sourceSize:size toBuffer:output_bytes destinationOffset:0
+           destinationBytesPerRow:bytes_per_row destinationBytesPerImage:length];
+        [blit endEncoding];
+        [cmdbuf addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+          const unsigned char *images[2] = { source_bytes.contents, output_bytes.contents };
+          const char *names[2] = { "source-RGBA", "drawable-BGRA" };
+          unsigned image;
+          for (image = 0; image < 2; image++) {
+            uint64_t hash = 1469598103934665603ull;
+            NSUInteger rgb = 0, alpha = 0, pixels = width * height, x, y;
+            unsigned min_byte = 255, max_byte = 0;
+            for (y = 0; y < height; y++) {
+              const unsigned char *row = images[image] + y * bytes_per_row;
+              for (x = 0; x < width; x++) {
+                const unsigned char *p = row + x * 4;
+                unsigned k;
+                if (p[0] || p[1] || p[2]) rgb++;
+                if (p[3]) alpha++;
+                for (k = 0; k < 4; k++) {
+                  if (p[k] < min_byte) min_byte = p[k];
+                  if (p[k] > max_byte) max_byte = p[k];
+                  hash = (hash ^ p[k]) * 1099511628211ull;
+                }
+              }
+            }
+            fprintf(stderr, "[scanout-proof] ml2036 frame=%llu %s rgb=%lu/%lu alpha=%lu/%lu byte=%u..%u hash=%016llx status=%lu\n",
+                    (unsigned long long)frame, names[image], (unsigned long)rgb, (unsigned long)pixels,
+                    (unsigned long)alpha, (unsigned long)pixels, min_byte, max_byte,
+                    (unsigned long long)hash, (unsigned long)completed.status);
+          }
+        }];
+      } else {
+        fprintf(stderr, "[scanout-proof] ml2036 frame=%llu readback allocation/encoder failed\n",
+                (unsigned long long)frame);
+      }
+      [source_bytes release];
+      [output_bytes release];
+    }
+  }
+  return YES;
+}
+#endif
+
 static NTSTATUS
 _MTLCommandBuffer_encodeSpatialScale(void *obj) {
   struct unixcall_mtlcommandbuffer_spatial_scale *params = obj;
   id<MTLCommandBuffer> cmdbuf = (id<MTLCommandBuffer>)params->cmdbuf;
   id<MTLFXSpatialScaler> scaler = (id<MTLFXSpatialScaler>)params->scaler;
-  scaler.colorTexture = (id<MTLTexture>)params->color;
-  scaler.outputTexture = (id<MTLTexture>)params->output;
+  id<MTLTexture> color = (id<MTLTexture>)params->color;
+  id<MTLTexture> output = (id<MTLTexture>)params->output;
+#if TARGET_OS_IOS
+  if (madeira_encode_rgba_bgra_scanout(cmdbuf, color, output)) return STATUS_SUCCESS;
+#endif
+  scaler.colorTexture = color;
+  scaler.outputTexture = output;
   scaler.fence = (id<MTLFence>)params->fence;
   [scaler encodeToCommandBuffer:cmdbuf];
   return STATUS_SUCCESS;
@@ -3225,6 +3420,41 @@ _MetalLayer_nextDrawable(void *obj) {
     }
     return STATUS_SUCCESS;
   }
+#if TARGET_OS_IOS
+  /* ml2036: a CAMetalLayer can keep issuing and recycling valid drawables even
+   * while its UIView has been reordered underneath SwiftUI's opaque root.
+   * Audit and repair the actual layer delegate/view at the first acquire. */
+  {
+    static _Atomic int audited;
+    CAMetalLayer *layer = (CAMetalLayer *)params->handle;
+    if (!atomic_exchange_explicit(&audited, 1, memory_order_relaxed)) {
+      execute_on_main(^{
+        id delegate = layer.delegate;
+        UIView *view = [delegate isKindOfClass:[UIView class]] ? (UIView *)delegate : nil;
+        UIView *parent = view.superview;
+        UIWindow *window = view.window;
+        NSUInteger before = parent ? [parent.subviews indexOfObjectIdenticalTo:view] : NSNotFound;
+        if (view) {
+          view.hidden = NO;
+          view.alpha = 1.0;
+          if (parent) [parent bringSubviewToFront:view];
+        }
+        layer.hidden = NO;
+        layer.opacity = 1.0;
+        NSUInteger after = parent ? [parent.subviews indexOfObjectIdenticalTo:view] : NSNotFound;
+        fprintf(stderr, "[scanout-host] ml2036 layer=%p delegate=%p view=%p parent=%p window=%p hidden=%d alpha=%.2f "
+                        "layerHidden=%d opacity=%.2f frame=(%.1f,%.1f %.1fx%.1f) bounds=%.1fx%.1f drawable=%.0fx%.0f "
+                        "z=%ld->%ld/%lu\n",
+                layer, delegate, view, parent, window, view ? view.hidden : -1, view ? view.alpha : -1.0,
+                layer.hidden, layer.opacity, view.frame.origin.x, view.frame.origin.y,
+                view.frame.size.width, view.frame.size.height, layer.bounds.size.width, layer.bounds.size.height,
+                layer.drawableSize.width, layer.drawableSize.height,
+                before == NSNotFound ? -1l : (long)before, after == NSNotFound ? -1l : (long)after,
+                (unsigned long)parent.subviews.count);
+      });
+    }
+  }
+#endif
   /* iOS-Madeira 2026-07-05 RAW mode (mode 2): the mailbox skip lives HERE,
    * before any drawable is consumed. First attempt gated at the
    * presentDrawable thunk — too late: every game frame had already

@@ -1146,6 +1146,9 @@ enum WMTRenderCommandType : uint16_t {
   WMTRenderCommandSetFragmentSamplerState,
   WMTRenderCommandSetVertexTexture,
   WMTRenderCommandSetVertexSamplerState,
+  /* ml2043: Apple's DXIL hull/domain emulation draw helper. Appended so the
+   * existing command wire values remain stable. */
+  WMTRenderCommandMadeiraTessellationDraw,
 };
 
 struct wmtcmd_render_nop {
@@ -1440,6 +1443,31 @@ struct wmtcmd_render_dxmt_geometry_draw_indexed {
   uint32_t warp_count;
   uint32_t instance_count;
   uint32_t vertex_per_warp;
+};
+
+struct WMTTessellationConfig {
+  uint32_t output_primitive;
+  uint32_t vs_output_size;
+  uint32_t gs_max_input_primitives;
+  uint32_t hs_max_patches;
+  uint32_t hs_input_control_points;
+  uint32_t hs_max_object_threads;
+  float hs_max_tessellation_factor;
+  uint32_t gs_instance_count;
+};
+
+struct wmtcmd_render_madeira_tessellation_draw {
+  enum WMTRenderCommandType type;
+  uint16_t reserved[3];
+  struct WMTMemoryPointer next;
+  struct WMTTessellationConfig config;
+  obj_handle_t index_buffer;       /* 0 for a non-indexed draw */
+  uint32_t index_type;             /* MTLIndexType: 0 uint16, 1 uint32 */
+  uint32_t instance_count;
+  uint32_t count_per_instance;
+  uint32_t base_instance;
+  int32_t base_vertex;
+  uint32_t start_index_or_vertex;
 };
 
 struct wmtcmd_render_dxmt_geometry_draw_indirect {

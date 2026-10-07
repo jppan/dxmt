@@ -2,12 +2,14 @@
 #include "com/com_pointer.hpp"
 #include "dxgi_options.hpp"
 #include "util_string.hpp"
+#include "thread.hpp"
 #include "log/log.hpp"
 #include "wsi_monitor.hpp"
 #include "dxgi_interfaces.h"
 #include "dxgi_object.hpp"
 #include "d3d10_1.h"
 #include "Metal.hpp"
+#include <atomic>
 #include <cstdio>     /* ml1007 */
 #include <cstdlib>
 #include <mutex>
@@ -37,6 +39,11 @@ public:
   };
 
   ~MTLDXGIAdatper() {
+    /* ml2052: stop the budget poller before device_ and its event table are
+     * destroyed.  Its 250 ms polling period also bounds this join. */
+    budget_notify_stop_.store(true, std::memory_order_release);
+    if (budget_notify_thread_.joinable())
+      budget_notify_thread_.join();
     if (local_kmt_) {
       D3DKMT_CLOSEADAPTER close = {};
       close.hAdapter = local_kmt_;
@@ -285,7 +292,7 @@ public:
     return S_OK;
   }
 
-  /* ml1007: implement budget-change notification registration.
+  /* ml1007/ml2052: implement budget-change notification registration.
    *
    * These two were `assert(0 && "TODO")`. The Register variant additionally had
    * no return statement at all, so even with NDEBUG it falls off the end of a
@@ -299,12 +306,12 @@ public:
    * for real -- a unique cookie, the handle retained, and Unregister actually
    * removing it -- so the bookkeeping the caller observes is truthful.
    *
-   * We do NOT fabricate notifications. QueryVideoMemoryInfo reports Budget from
-   * the Metal device's recommended working-set size, which does not change
-   * during a run on this platform, so no budget-change event is due and an
-   * event that never fires is the accurate outcome rather than a missing
-   * feature. If Budget ever becomes dynamic, signal the registered handles at
-   * the point it changes -- that is the only correct place for it.
+   * The iOS unix side now reports a DYNAMIC process budget: once shared CPU/GPU
+   * memory approaches the jetsam line it lowers recommendedMaxWorkingSetSize.
+   * ml2052 polls that authoritative value and signals every registered event
+   * when it changes. This is how engines know to re-query and retire streaming
+   * heaps; without it a title that queried only at startup kept its original
+   * pool until iOS killed the app.
    *
    * ⛔ MEASURED, rdr77 vs rdr78 -- a clean single-variable A/B on the same
    * build, flipping only the file below:
@@ -315,14 +322,12 @@ public:
    * So the caller really does wait on this event, and "register successfully and
    * never signal" is NOT an acceptable reading of a static budget -- Astra's
    * warning against returning fake success was correct and my first
-   * implementation was wrong. DEFAULT IS THEREFORE THE HONEST FAILURE.
-   *
-   * Documents/madeira-dxgi-budget.txt = 1 re-enables real registration, for
-   * when Budget becomes dynamic and we can actually signal the handles. Do not
-   * enable it before there is a signalling path. */
+   * implementation was wrong. Now that the event has a live producer,
+   * registration is the default; Documents/madeira-dxgi-budget.txt = 0 is the
+   * compatibility escape hatch. */
   HRESULT STDMETHODCALLTYPE RegisterVideoMemoryBudgetChangeNotificationEvent(
       HANDLE event, DWORD *cookie) override {
-    if (!cookie)
+    if (!event || !cookie)
       return E_INVALIDARG;
 
     if (!budget_notify_enabled()) {
@@ -331,13 +336,27 @@ public:
       return DXGI_ERROR_UNSUPPORTED;
     }
 
-    std::lock_guard<std::mutex> lock(budget_mutex_);
-    DWORD assigned = ++budget_cookie_seq_;
-    budget_events_.emplace_back(assigned, event);
+    DWORD assigned;
+    {
+      std::lock_guard<std::mutex> lock(budget_mutex_);
+      assigned = ++budget_cookie_seq_;
+      budget_events_.emplace_back(assigned, event);
+      if (!budget_notify_thread_.joinable()) {
+        budget_notify_stop_.store(false, std::memory_order_release);
+        try {
+          budget_notify_thread_ = dxmt::thread([this]() { budget_notify_worker(); });
+          budget_notify_thread_.set_priority(ThreadPriority::Lowest);
+        } catch (...) {
+          budget_events_.pop_back();
+          *cookie = 0;
+          Logger::warn("DXGI: could not start video-memory budget notifier");
+          return E_FAIL;
+        }
+      }
+    }
     *cookie = assigned;
-    Logger::warn(str::format("DXGI: registered video-memory budget notification "
-                             "cookie=", assigned, " (budget is static on this "
-                             "platform, so no notification is expected)"));
+    Logger::warn(str::format("DXGI: ml2052 registered live video-memory budget notification "
+                             "cookie=", assigned));
     return S_OK;
   }
 
@@ -362,21 +381,47 @@ public:
   D3DKMT_HANDLE STDMETHODCALLTYPE GetLocalD3DKMT() final { return local_kmt_; }
 
 private:
-  /* ml1007: read once. Absent file (the normal case) leaves this enabled. */
+  /* ml2052: poll the same authoritative value QueryVideoMemoryInfo returns.
+   * The unix side rate-limits task_info to 250 ms, so matching that cadence
+   * adds no extra pressure. Auto-reset events coalesce repeated changes. */
+  void budget_notify_worker() {
+    uint64_t previous = device_.recommendedMaxWorkingSetSize();
+    while (!budget_notify_stop_.load(std::memory_order_acquire)) {
+      Sleep(250);
+      if (budget_notify_stop_.load(std::memory_order_acquire))
+        break;
+
+      const uint64_t current = device_.recommendedMaxWorkingSetSize();
+      if (!current || current == previous)
+        continue;
+      previous = current;
+
+      size_t event_count;
+      {
+        std::lock_guard<std::mutex> lock(budget_mutex_);
+        event_count = budget_events_.size();
+        for (const auto &entry : budget_events_)
+          SetEvent(entry.second);
+      }
+      Logger::warn(str::format("DXGI: ml2052 video-memory budget changed to ",
+                               current >> 20, " MB; signalled ", event_count,
+                               " registration(s)"));
+    }
+  }
+
+  /* ml1007/ml2052: read once. A literal 0 disables the live notifier. */
   static bool budget_notify_enabled() {
-    /* Default FALSE: see the A/B in the comment above. Only an explicit "1"
-     * turns real registration back on. */
     static const bool enabled = [] {
       const char *docs = std::getenv("MADEIRA_DOCS_DIR");
       if (!docs || !*docs)
-        return false;
+        return true;
       std::string path = std::string(docs) + "/madeira-dxgi-budget.txt";
       FILE *f = std::fopen(path.c_str(), "r");
       if (!f)
-        return false;
+        return true;
       int c = std::fgetc(f);
       std::fclose(f);
-      return c == '1';
+      return c != '0';
     }();
     return enabled;
   }
@@ -389,6 +434,8 @@ private:
   std::mutex budget_mutex_;
   std::vector<std::pair<DWORD, HANDLE>> budget_events_;
   DWORD budget_cookie_seq_ = 0;
+  std::atomic<bool> budget_notify_stop_ {false};
+  dxmt::thread budget_notify_thread_;
 };
 
 Com<IMTLDXGIAdapter> CreateAdapter(WMT::Device Device,

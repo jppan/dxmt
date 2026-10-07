@@ -289,13 +289,14 @@ static uint64_t madeira_ml1075_dynamic_budget(uint64_t base) {
     uint64_t foot = 0, limit, high, budget = base;
     if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt) == KERN_SUCCESS) foot = vmi.phys_footprint;
     limit = (uint64_t)os_proc_available_memory() + foot;
-    /* ml1103: madeira.cfg vram-trim-mb = distance below the kill line where the
-     * trim starts (default 1536, the ml1075 value); 0 = never trim. ph-rdr56:
-     * raising vram-mb to 3072 doubled the snow-scene frame rate, but in the city
-     * the footprint reached 7.1 GB, this trim cut the budget to 2625 MB, and the
-     * game went back to evicting and re-streaming (the pop-in). */
+    /* ml1103/ml2053: madeira.cfg vram-trim-mb = distance below the kill line
+     * where the trim starts (default 1536); 0 = never trim. ml2052 raised this
+     * to 2048 MB, but one-shot engines did not observe the live notification;
+     * they kept allocating the same placement heaps while streaming against a
+     * smaller steady-state budget, regressing frame rate without preventing
+     * jetsam. Heap creation now has a separate last-line headroom guard. */
     { static long long trim_mb = -1; if (trim_mb < 0) { trim_mb = madeira_cfg_int("vram-trim-mb", 1536); if (trim_mb < 0) trim_mb = 1536;
-        fprintf(stderr, "[wmt] ml1103 video budget trim starts %lld MB below the kill line (madeira.cfg vram-trim-mb; 0 = never)\n", trim_mb); }
+        fprintf(stderr, "[wmt] ml2053 video budget trim starts %lld MB below the kill line (madeira.cfg vram-trim-mb; 0 = never)\n", trim_mb); }
       high = trim_mb ? (limit > ((uint64_t)trim_mb << 20) ? limit - ((uint64_t)trim_mb << 20) : 0) : ~0ull; }
     if (foot > high) budget = base > foot - high ? base - (foot - high) : 0;
     if (budget < (768ull << 20)) budget = 768ull << 20;
@@ -322,14 +323,19 @@ static uint64_t madeira_ml1042_video_budget(uint64_t metal_recommended) {
     task_vm_info_data_t vmi; mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
     if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt) == KERN_SUCCESS) foot = vmi.phys_footprint;
     limit = (uint64_t)os_proc_available_memory() + foot;
-    const uint64_t guest_ram = 4096ull << 20;      /* what ml992 lets the guest see */
-    const uint64_t overhead  = 2560ull << 20;      /* JIT pool + FEX + Wine + host, measured */
+    /* ml2054: match Unix ntdll's automatic Windows physical-memory report.
+     * The 8 GB process is partitioned into 5 GB guest RAM, 1.5 GB video memory
+     * and 1.5 GB of Wine/FEX/native overhead. Previously this calculation
+     * assumed a 4 GB guest while ml992 actually exposed the device's 7.5 GB of
+     * physical RAM, so the two independent budgets could never fit together. */
+    const uint64_t guest_ram = 5120ull << 20;
+    const uint64_t overhead  = 1536ull << 20;
     budget = limit > guest_ram + overhead ? limit - guest_ram - overhead : 0;
     if (budget < (1024ull << 20)) budget = 1024ull << 20;
   }
   if (metal_recommended && budget > metal_recommended) budget = metal_recommended;
   cached = budget;
-  fprintf(stderr, "[wmt] ml1042 video memory budget = %llu MB (process limit %llu MB, footprint now %llu MB, "
+  fprintf(stderr, "[wmt] ml2053 video memory budget = %llu MB (process limit %llu MB, footprint now %llu MB, "
                   "Metal recommends %llu MB)\n",
           (unsigned long long)(budget >> 20), (unsigned long long)(limit >> 20),
           (unsigned long long)(foot >> 20), (unsigned long long)(metal_recommended >> 20));
@@ -6147,18 +6153,18 @@ static NTSTATUS _madeira_ctl(void *args) {
     a->ret = 1;
     break;
   }
-  case 7: {   /* ml2000: memory headroom for DXMT's automatic mip clamp.
+  case 7: {   /* ml2000/ml2053: memory headroom for graphics allocation guards.
                * len = os_proc_available_memory() bytes, ptr = phys_footprint
-               * bytes (0 when task_info fails), ret = 1. ret stays 0 when the
-               * limit is unknown (0 from os_proc_available_memory) and in
-               * remote mode, where textures live on the other machine. No
+               * bytes (0 when task_info fails), ret = 1. A zero available-byte
+               * result is valid at the iOS limit and must not look like an
+               * unavailable query. ret stays 0 in remote mode, where textures
+               * live on the other machine. No
                * pointer is read or written, which is why the wow64 entry may
                * forward this op unchanged. */
     task_vm_info_data_t vmi; mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
     uint64_t avail;
     if (wmtr_enabled()) break;
     avail = (uint64_t)os_proc_available_memory();
-    if (!avail) break;
     a->len = avail;
     a->ptr = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt) == KERN_SUCCESS
                  ? (uint64_t)vmi.phys_footprint : 0;
